@@ -107,15 +107,23 @@ st.markdown("""
 # =======================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-@st.cache_resource
+@st.cache_resource(show_spinner="Loading AI model...")
 def load():
     model_path = "final_model_11111.pth"
 
     if not os.path.exists(model_path):
-        st.error("❌ Model file not found. Check GitHub repo.")
+        st.error("❌ Model file NOT found in repo")
         st.stop()
 
-    return load_model(model_path, device)
+    try:
+        model = load_model(model_path, device)
+        return model
+    except Exception as e:
+        st.error(f"❌ Model loading failed: {e}")
+        st.stop()
+
+# Load model safely
+model = load()
 # =======================
 # SIDEBAR
 # =======================
