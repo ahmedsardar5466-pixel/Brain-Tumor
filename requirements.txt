@@ -4,3 +4,4 @@ torchvision
 opencv-python-headless
 numpy
 pillow
+mysql-connector-python

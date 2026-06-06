@@ -1,16 +1,26 @@
 # =======================
 # IMPORTS
 # =======================
-import os
+import hashlib
 import io
-import numpy as np
+import os
+
 import cv2
-import torch
+import numpy as np
 import streamlit as st
+import torch
 from PIL import Image, ImageFile
 
-from model_utils import load_model, predict_image, CLASS_NAMES, get_transform
+from auth import (
+    authenticate_user,
+    create_user,
+    delete_user,
+    update_user_name,
+    update_user_password,
+)
+from db import get_scan_history, init_db, save_scan_record
 from gradcam_utils import GradCAM
+from model_utils import CLASS_NAMES, get_transform, load_model, predict_image
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -22,7 +32,8 @@ st.set_page_config(page_title="Brain Tumor MRI Classification", layout="wide")
 # =======================
 # PROFESSIONAL UI
 # =======================
-st.markdown("""
+st.markdown(
+    """
 <style>
 
 .stApp {
@@ -64,6 +75,11 @@ html, body, [class*="css"] {
     padding: 18px;
     margin-bottom: 16px;
     box-shadow: 0 8px 22px rgba(31, 41, 55, 0.05);
+}
+
+.auth-card {
+    max-width: 520px;
+    margin: 0 auto 18px auto;
 }
 
 .section-title {
@@ -154,22 +170,59 @@ section[data-testid="stSidebar"] {
 }
 
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 # =======================
 # HEADER
 # =======================
-st.markdown("""
+st.markdown(
+    """
 <div class="header">
     <h1>Brain Tumor MRI Classification</h1>
-    <p>Upload a brain MRI scan to classify the image and review model confidence with visual explainability.</p>
+    <p>Create an account, log in, upload a brain MRI scan, and keep a saved history of analysis results.</p>
 </div>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
+
+CLASS_COLORS = {
+    "glioma": "#ff4d4f",
+    "meningioma": "#f59e0b",
+    "notumor": "#22c55e",
+    "pituitary": "#3b82f6",
+}
+
+CLASS_LABELS = {
+    "glioma": "Glioma",
+    "meningioma": "Meningioma",
+    "notumor": "No Tumor",
+    "pituitary": "Pituitary",
+}
+
+
+# =======================
+# DATABASE
+# =======================
+try:
+    init_db()
+except Exception as e:
+    st.error("Database connection failed. Please start MySQL and check your database settings.")
+    st.info(
+        "Default settings: host=localhost, port=3306, user=root, password empty, database=brain_tumor_app. "
+        "You can override these with environment variables DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME "
+        "or Streamlit secrets."
+    )
+    st.exception(e)
+    st.stop()
+
 
 # =======================
 # MODEL
 # =======================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 @st.cache_resource(show_spinner="Loading AI model...")
 def load():
@@ -180,14 +233,10 @@ def load():
         st.stop()
 
     try:
-        model = load_model(model_path, device)
-        return model
+        return load_model(model_path, device)
     except Exception as e:
         st.error(f"Model loading failed: {e}")
         st.stop()
-
-# Load model safely
-model = load()
 
 
 def show_response_popup(title, message, level="warning"):
@@ -204,52 +253,194 @@ def show_response_popup(title, message, level="warning"):
         _popup()
     else:
         st.toast(message)
-# =======================
-# SIDEBAR
-# =======================
-st.sidebar.title("Scan Analysis")
 
-uploaded = st.sidebar.file_uploader(
-    "Upload brain MRI scan",
-    type=["jpg","jpeg","png","jfif","bmp","tiff","webp"]
-)
 
-confidence_threshold = st.sidebar.slider(
-    "Minimum Confidence",
-    0.0,
-    1.0,
-    0.6,
-    help="Predictions below this confidence will be marked as uncertain."
-)
+def login_user(user):
+    st.session_state["logged_in"] = True
+    st.session_state["user_id"] = user["id"]
+    st.session_state["user_name"] = user["name"]
+    st.session_state["user_email"] = user["email"]
 
-st.sidebar.markdown("---")
-st.sidebar.info("For best results, upload a clear axial, coronal, or sagittal brain MRI image.")
 
-# =======================
-# MAIN
-# =======================
-if uploaded:
+def logout_user():
+    for key in ["logged_in", "user_id", "user_name", "user_email", "last_saved_scan"]:
+        st.session_state.pop(key, None)
 
-    col1, col2 = st.columns([1,1])
+
+def show_auth_page():
+    st.markdown('<div class="card auth-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Account Access</div>', unsafe_allow_html=True)
+
+    login_tab, signup_tab = st.tabs(["Login", "Create Account"])
+
+    with login_tab:
+        with st.form("login_form"):
+            email = st.text_input("Email", key="login_email")
+            password = st.text_input("Password", type="password", key="login_password")
+            submitted = st.form_submit_button("Login")
+
+        if submitted:
+            if not email or not password:
+                st.warning("Please enter email and password.")
+            else:
+                user = authenticate_user(email, password)
+                if user:
+                    login_user(user)
+                    st.success("Login successful.")
+                    st.rerun()
+                else:
+                    st.error("Invalid email or password.")
+
+    with signup_tab:
+        with st.form("signup_form"):
+            name = st.text_input("Full Name")
+            email = st.text_input("Email", key="signup_email")
+            password = st.text_input("Password", type="password", key="signup_password")
+            confirm_password = st.text_input("Confirm Password", type="password")
+            submitted = st.form_submit_button("Create Account")
+
+        if submitted:
+            if not name or not email or not password:
+                st.warning("Please fill all required fields.")
+            elif password != confirm_password:
+                st.error("Passwords do not match.")
+            elif len(password) < 6:
+                st.error("Password must be at least 6 characters.")
+            else:
+                user = create_user(name, email, password)
+                if user:
+                    login_user(user)
+                    st.success("Account created successfully.")
+                    st.rerun()
+                else:
+                    st.error("This email is already registered.")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def show_account_tools():
+    st.sidebar.title("Account")
+    st.sidebar.success(f"Logged in as {st.session_state['user_name']}")
+    st.sidebar.caption(st.session_state["user_email"])
+
+    with st.sidebar.expander("Account Settings"):
+        with st.form("update_name_form"):
+            new_name = st.text_input("Name", value=st.session_state["user_name"])
+            update_name = st.form_submit_button("Update Name")
+
+        if update_name:
+            if update_user_name(st.session_state["user_id"], new_name):
+                st.session_state["user_name"] = new_name.strip()
+                st.success("Name updated.")
+                st.rerun()
+            else:
+                st.error("Name could not be updated.")
+
+        with st.form("password_form"):
+            current_password = st.text_input("Current Password", type="password")
+            new_password = st.text_input("New Password", type="password")
+            change_password = st.form_submit_button("Change Password")
+
+        if change_password:
+            if len(new_password) < 6:
+                st.error("New password must be at least 6 characters.")
+            elif update_user_password(st.session_state["user_id"], current_password, new_password):
+                st.success("Password updated.")
+            else:
+                st.error("Current password is incorrect.")
+
+        delete_confirm = st.checkbox("I understand this will delete my account and scan history.")
+        if st.button("Delete Account", disabled=not delete_confirm):
+            if delete_user(st.session_state["user_id"]):
+                logout_user()
+                st.success("Account deleted.")
+                st.rerun()
+            else:
+                st.error("Account could not be deleted.")
+
+    if st.sidebar.button("Logout"):
+        logout_user()
+        st.rerun()
+
+
+def show_scan_history():
+    st.markdown("## Scan History")
+    rows = get_scan_history(st.session_state["user_id"])
+
+    if not rows:
+        st.info("No scan records yet.")
+        return
+
+    display_rows = []
+    for row in rows:
+        display_rows.append(
+            {
+                "File": row["file_name"],
+                "Prediction": CLASS_LABELS.get(row["predicted_class"], row["predicted_class"]),
+                "Confidence": f"{float(row['confidence']) * 100:.1f}%",
+                "Date": row["created_at"].strftime("%Y-%m-%d %H:%M"),
+            }
+        )
+    st.table(display_rows)
+
+
+def save_prediction_once(image_bytes, file_name, predicted_class, confidence):
+    file_hash = hashlib.sha256(image_bytes).hexdigest()
+    signature = f"{st.session_state['user_id']}:{file_hash}:{predicted_class}:{confidence:.6f}"
+
+    if st.session_state.get("last_saved_scan") == signature:
+        return
+
+    save_scan_record(st.session_state["user_id"], file_name, predicted_class, confidence)
+    st.session_state["last_saved_scan"] = signature
+
+
+def show_dashboard():
+    model = load()
+    show_account_tools()
+
+    st.sidebar.title("Scan Analysis")
+    uploaded = st.sidebar.file_uploader(
+        "Upload brain MRI scan",
+        type=["jpg", "jpeg", "png", "jfif", "bmp", "tiff", "webp"],
+    )
+
+    confidence_threshold = st.sidebar.slider(
+        "Minimum Confidence",
+        0.0,
+        1.0,
+        0.6,
+        help="Predictions below this confidence will be marked as uncertain.",
+    )
+
+    st.sidebar.markdown("---")
+    st.sidebar.info("For best results, upload a clear axial, coronal, or sagittal brain MRI image.")
+
+    st.markdown(f"### Welcome, {st.session_state['user_name']}")
+
+    if not uploaded:
+        st.info("Upload a brain MRI scan from the sidebar to start analysis.")
+        show_scan_history()
+        return
+
+    col1, col2 = st.columns([1, 1])
 
     image_bytes = uploaded.read()
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-    # IMAGE
     with col1:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown('<div class="section-title">Uploaded MRI Scan</div>', unsafe_allow_html=True)
         st.image(image, caption="Source image", use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    # PREDICTION
     pred, probs = predict_image(model, image, device, confidence_threshold)
 
     if pred == "invalid_image":
         show_response_popup(
             "Image Not Supported",
             "The uploaded file does not appear to be a valid brain MRI scan. Please upload a clear MRI image and try again.",
-            "error"
+            "error",
         )
         st.stop()
 
@@ -260,29 +451,14 @@ if uploaded:
         show_response_popup(
             "Uncertain Result",
             f"The model confidence is below the selected threshold. Best estimate: {top_class.upper()} ({top_confidence:.1f}%). Please upload a clearer MRI scan for review.",
-            "warning"
+            "warning",
         )
         st.stop()
 
-
     predicted_class = CLASS_NAMES[pred]
     confidence = float(probs[pred])
+    save_prediction_once(image_bytes, uploaded.name, predicted_class, confidence)
 
-    CLASS_COLORS = {
-        "glioma": "#ff4d4f",
-        "meningioma": "#f59e0b",
-        "notumor": "#22c55e",
-        "pituitary": "#3b82f6"
-    }
-
-    CLASS_LABELS = {
-        "glioma": "Glioma",
-        "meningioma": "Meningioma",
-        "notumor": "No Tumor",
-        "pituitary": "Pituitary"
-    }
-
-    # RESULTS
     with col2:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown('<div class="section-title">Analysis Summary</div>', unsafe_allow_html=True)
@@ -292,7 +468,8 @@ if uploaded:
         else:
             st.markdown('<div class="result-badge alert">Tumor pattern detected</div>', unsafe_allow_html=True)
 
-        st.markdown(f"""
+        st.markdown(
+            f"""
         <div class="metric-row">
             <div class="metric-box">
                 <div class="metric-label">Predicted Class</div>
@@ -303,7 +480,9 @@ if uploaded:
                 <div class="metric-value">{confidence * 100:.1f}%</div>
             </div>
         </div>
-        """, unsafe_allow_html=True)
+        """,
+            unsafe_allow_html=True,
+        )
 
         st.markdown('<div class="section-title">Class Probability Breakdown</div>', unsafe_allow_html=True)
 
@@ -312,19 +491,19 @@ if uploaded:
             color = CLASS_COLORS[cls]
 
             st.markdown(f"**{CLASS_LABELS[cls]}**")
-            st.markdown(f"""
+            st.markdown(
+                f"""
             <div class="progress-bar">
-                <div class="progress-fill" style="width:{value*100}%; background:{color};">
+                <div class="progress-fill" style="width:{value * 100}%; background:{color};">
                     {value * 100:.1f}%
                 </div>
             </div>
-            """, unsafe_allow_html=True)
+            """,
+                unsafe_allow_html=True,
+            )
 
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    # =======================
-    # GRADCAM
-    # =======================
     st.markdown("## Model Explainability")
 
     if predicted_class == "notumor":
@@ -338,28 +517,37 @@ if uploaded:
 
         try:
             cam = GradCAM(model).generate(img_tensor, pred)
-            cam = cv2.resize(cam, (224,224))
+            cam = cv2.resize(cam, (224, 224))
 
             heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
-            overlay = cv2.addWeighted(
-                np.array(image.resize((224,224))), 0.6, heatmap, 0.4, 0
-            )
+            overlay = cv2.addWeighted(np.array(image.resize((224, 224))), 0.6, heatmap, 0.4, 0)
 
-            colA, colB = st.columns(2)
+            col_a, col_b = st.columns(2)
 
-            with colA:
+            with col_a:
                 st.image(image, caption="Original scan")
 
-            with colB:
+            with col_b:
                 st.image(overlay, caption="Grad-CAM heatmap")
 
-        except:
+        except Exception:
             st.error("Grad-CAM could not be generated for this scan. Please try another image.")
+
+    show_scan_history()
+
+
+if st.session_state.get("logged_in"):
+    show_dashboard()
+else:
+    show_auth_page()
 
 # =======================
 # FOOTER
 # =======================
-st.markdown("""
+st.markdown(
+    """
 <hr>
 <p style='text-align:center; color:#64748b;'>Brain Tumor MRI Classification | Deep Learning Decision Support | 2026</p>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
