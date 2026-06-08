@@ -27,16 +27,55 @@ def get_transform():
 
 def is_mri_like(image):
     import numpy as np
-    img = np.array(image)
-    return img.std() < 80
+
+    img = np.array(image.convert("RGB")).astype("float32")
+    gray = img.mean(axis=2)
+
+    channel_diff = (
+        np.abs(img[:, :, 0] - img[:, :, 1]).mean()
+        + np.abs(img[:, :, 1] - img[:, :, 2]).mean()
+        + np.abs(img[:, :, 0] - img[:, :, 2]).mean()
+    ) / 3
+    if channel_diff > 12:
+        return False
+
+    gray_std = gray.std()
+    if gray_std < 18 or gray_std > 95:
+        return False
+
+    height, width = gray.shape
+    border = max(1, min(height, width) // 12)
+    border_pixels = np.concatenate(
+        [
+            gray[:border, :].ravel(),
+            gray[-border:, :].ravel(),
+            gray[:, :border].ravel(),
+            gray[:, -border:].ravel(),
+        ]
+    )
+
+    dark_fraction = np.mean(gray < 35)
+    bright_fraction = np.mean(gray > 80)
+    border_dark_fraction = np.mean(border_pixels < 35)
+
+    center = gray[height // 4 : 3 * height // 4, width // 4 : 3 * width // 4]
+    center_is_brighter = center.mean() > border_pixels.mean() + 8
+
+    score = 0
+    score += dark_fraction >= 0.15
+    score += 0.04 <= bright_fraction <= 0.75
+    score += border_dark_fraction >= 0.35
+    score += center_is_brighter
+
+    return score >= 3
 
 
 def predict_image(model, image, device, conf_threshold=0.6):
-    transform = get_transform()
-    img = transform(image).unsqueeze(0).to(device)
-
     if not is_mri_like(image):
         return "invalid_image", None
+
+    transform = get_transform()
+    img = transform(image).unsqueeze(0).to(device)
 
     with torch.no_grad():
         outputs = model(img)

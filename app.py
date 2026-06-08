@@ -13,8 +13,14 @@ from PIL import Image, ImageFile
 
 from auth import (
     authenticate_user,
+    create_login_session,
     create_user,
+    delete_login_session,
     delete_user,
+    get_password_validation_error,
+    get_user_by_session_token,
+    is_valid_email,
+    is_valid_name,
     update_user_name,
     update_user_password,
 )
@@ -262,14 +268,47 @@ def login_user(user):
     st.session_state["user_email"] = user["email"]
 
 
+def get_session_token_from_url():
+    token = st.query_params.get("session")
+    if isinstance(token, list):
+        return token[0] if token else None
+    return token
+
+
+def persist_login(user):
+    token = create_login_session(user["id"])
+    st.session_state["session_token"] = token
+    st.query_params["session"] = token
+
+
+def restore_login_from_url():
+    if st.session_state.get("logged_in"):
+        return
+
+    token = get_session_token_from_url()
+    user = get_user_by_session_token(token)
+    if user:
+        login_user(user)
+        st.session_state["session_token"] = token
+    elif token:
+        st.query_params.clear()
+
+
 def logout_user():
-    for key in ["logged_in", "user_id", "user_name", "user_email", "last_saved_scan"]:
+    token = st.session_state.get("session_token") or get_session_token_from_url()
+    delete_login_session(token)
+    st.query_params.clear()
+
+    for key in ["logged_in", "user_id", "user_name", "user_email", "last_saved_scan", "session_token"]:
         st.session_state.pop(key, None)
 
 
 def show_auth_page():
     st.markdown('<div class="card auth-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-title">Account Access</div>', unsafe_allow_html=True)
+
+    if st.session_state.pop("account_created", False):
+        st.success("Account created successfully. Please log in with your email and password.")
 
     login_tab, signup_tab = st.tabs(["Login", "Create Account"])
 
@@ -282,10 +321,13 @@ def show_auth_page():
         if submitted:
             if not email or not password:
                 st.warning("Please enter email and password.")
+            elif not is_valid_email(email):
+                st.error("Please enter a valid email address.")
             else:
                 user = authenticate_user(email, password)
                 if user:
                     login_user(user)
+                    persist_login(user)
                     st.success("Login successful.")
                     st.rerun()
                 else:
@@ -300,17 +342,24 @@ def show_auth_page():
             submitted = st.form_submit_button("Create Account")
 
         if submitted:
+            password_error = get_password_validation_error(password)
+
             if not name or not email or not password:
                 st.warning("Please fill all required fields.")
+            elif not is_valid_name(name):
+                st.error("Full name must be 3-80 letters and cannot contain numbers or invalid symbols.")
+            elif not is_valid_email(email):
+                st.error("Please enter a valid email address.")
+            elif not confirm_password:
+                st.error("Please confirm your password.")
             elif password != confirm_password:
                 st.error("Passwords do not match.")
-            elif len(password) < 6:
-                st.error("Password must be at least 6 characters.")
+            elif password_error:
+                st.error(password_error)
             else:
                 user = create_user(name, email, password)
                 if user:
-                    login_user(user)
-                    st.success("Account created successfully.")
+                    st.session_state["account_created"] = True
                     st.rerun()
                 else:
                     st.error("This email is already registered.")
@@ -329,7 +378,9 @@ def show_account_tools():
             update_name = st.form_submit_button("Update Name")
 
         if update_name:
-            if update_user_name(st.session_state["user_id"], new_name):
+            if not is_valid_name(new_name):
+                st.error("Full name must be 3-80 letters and cannot contain numbers or invalid symbols.")
+            elif update_user_name(st.session_state["user_id"], new_name):
                 st.session_state["user_name"] = new_name.strip()
                 st.success("Name updated.")
                 st.rerun()
@@ -342,8 +393,9 @@ def show_account_tools():
             change_password = st.form_submit_button("Change Password")
 
         if change_password:
-            if len(new_password) < 6:
-                st.error("New password must be at least 6 characters.")
+            password_error = get_password_validation_error(new_password)
+            if password_error:
+                st.error(password_error)
             elif update_user_password(st.session_state["user_id"], current_password, new_password):
                 st.success("Password updated.")
             else:
@@ -439,7 +491,7 @@ def show_dashboard():
     if pred == "invalid_image":
         show_response_popup(
             "Image Not Supported",
-            "The uploaded file does not appear to be a valid brain MRI scan. Please upload a clear MRI image and try again.",
+            "This picture does not look like a valid brain MRI scan. The app can detect brain tumor classes only from brain MRI images.",
             "error",
         )
         st.stop()
@@ -535,6 +587,8 @@ def show_dashboard():
 
     show_scan_history()
 
+
+restore_login_from_url()
 
 if st.session_state.get("logged_in"):
     show_dashboard()
